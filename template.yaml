@@ -2,13 +2,8 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
   arxiv-citation-scanner
-  從既有 S3 Bucket 讀取論文列表，並行查詢 Semantic Scholar 引用資訊
 
-Parameters:
-  ExistingDataBucketName:
-    Type: String
-    Description: Name of the **existing** S3 bucket that stores paper data
-    Default: arxiv-dataset-376926525020-us-east-1
+  一個高效的、基於 Lambda 的論文引用資訊並行查詢器，從 S3 讀取論文列表，並使用 OpenAlex API 查詢數據。
 
 Globals:
   Function:
@@ -18,47 +13,55 @@ Globals:
       - x86_64
 
 Resources:
-  # ---- SQS 隊列 ----
+  ArxivDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "arxiv-dataset-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
   CitationJobQueue:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: CitationJobQueue
       VisibilityTimeout: 500
-      MessageRetentionPeriod: 1209600   # 14 天
+      MessageRetentionPeriod: 1209600
 
-  # ---- Dispatcher Lambda ----
   CitationDispatcherFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/dispatcher_citation/
       Handler: citation_dispatcher_lambda.handler
       Timeout: 900
-      MemorySize: 2048
-      EphemeralStorage:
-        Size: 2048
+      MemorySize: 1024
       Environment:
         Variables:
           SQS_QUEUE_URL: !Ref CitationJobQueue
-          S3_BUCKET_NAME: !Ref ExistingDataBucketName
+          S3_BUCKET_NAME: !Ref ArxivDataBucket
+          INPUT_S3_PREFIX: "cleaned_data/"
       Policies:
-        - S3ReadPolicy:        # 讀 S3 上的論文 CSV
-            BucketName: !Ref ExistingDataBucketName
-        - SQSSendMessagePolicy: # 發送訊息到隊列
-            QueueName: CitationJobQueue
+        - S3ReadPolicy: { BucketName: !Ref ArxivDataBucket }
+        - SQSQueuePolicy: { QueueName: !GetAtt CitationJobQueue.QueueName }
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CitationDispatcherFunction
 
-  # ---- Worker Lambda ----
   CitationWorkerFunction:
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: src/worker_citation/
+      CodeUri: src/worker_citation/ # 需要包含 requirements.txt (requests)
       Handler: citation_worker_lambda.handler
       Timeout: 450
+      ReservedConcurrentExecutions: 50
       Environment:
         Variables:
-          S3_BUCKET_NAME: !Ref ExistingDataBucketName
+          S3_BUCKET_NAME: !Ref ArxivDataBucket
+          # --- 新增的環境變數 ---
+          OPENALEX_EMAIL: "your-email@example.com" # 建議部署後修改為真實 Email
       Policies:
-        - S3WritePolicy:       # 寫回查詢結果
-            BucketName: !Ref ExistingDataBucketName
+        - S3WritePolicy: { BucketName: !Ref ArxivDataBucket }
       Events:
         SQSTrigger:
           Type: SQS
@@ -67,10 +70,9 @@ Resources:
             BatchSize: 1
 
 Outputs:
-  DataBucketName:
-    Description: "Existing S3 Bucket used for paper data"
-    Value: !Ref ExistingDataBucketName
-
+  S3BucketName:
+    Description: "儲存所有數據的 S3 儲存桶名稱"
+    Value: !Ref ArxivDataBucket
   CitationDispatcherFunctionName:
-    Description: "Dispatcher Lambda Function name"
+    Description: "引用查詢分派器 Lambda 名稱"
     Value: !Ref CitationDispatcherFunction
