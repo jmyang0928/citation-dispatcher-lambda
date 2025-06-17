@@ -40,11 +40,15 @@ Resources:
       Policies:
         - S3ReadPolicy:
             BucketName: !Ref ExistingDataBucketName
-        # --- FIX IS HERE: Replaced SQSQueuePolicy with the more specific SQSSendMessagePolicy ---
         - SQSSendMessagePolicy:
             QueueName: !GetAtt CitationJobQueue.QueueName
-        - LambdaInvokePolicy:
-            FunctionName: !Ref CitationDispatcherFunction
+        # --- FIX IS HERE: Replaced LambdaInvokePolicy with a custom statement to avoid circular dependency ---
+        - Statement:
+          - Effect: "Allow"
+            Action: "lambda:InvokeFunction"
+            # This grants permission to invoke any function created by this stack with this logical ID.
+            # The wildcard is necessary to break the circular dependency.
+            Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-CitationDispatcherFunction-*"
 
   CitationWorkerFunction:
     Type: AWS::Serverless::Function
