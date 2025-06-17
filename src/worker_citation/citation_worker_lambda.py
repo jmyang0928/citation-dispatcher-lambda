@@ -1,161 +1,177 @@
-import json
 import os
-import boto3
-import traceback
-import requests
-import urllib.parse
+import json
 import time
+import requests
+import boto3
+import logging
+from urllib.parse import quote_plus
+from typing import Dict, Any, List
+import secrets
 
-# 從環境變數獲取配置
-S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
-OPENALEX_EMAIL = os.environ.get('OPENALEX_EMAIL', 'default-user@example.com')
+# --- Configuration ---
+# Lambda 環境變數
+BUCKET = os.environ['BUCKET']
+OUTPUT_PREFIX = os.environ['OUTPUT_PREFIX']
+SUCCESS_FOLDER = os.environ.get('SUCCESS_FOLDER', 'success/')
+FAILURE_FOLDER = os.environ.get('FAILURE_FOLDER', 'failure/')
+OPENALEX_EMAIL = os.environ['OPENALEX_EMAIL']
 
-if not S3_BUCKET_NAME:
-    raise ValueError("Environment variable S3_BUCKET_NAME is not set")
+# Boto3 and other clients
+s3_client = boto3.client('s3')
+session = requests.Session() # 使用 Session 提升性能
 
-# 初始化 S3 客戶端
-s3 = boto3.client('s3')
+# Logger
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
-def handler(event, context):
+# --- Rate Limiter ---
+# OpenAlex 禮貌性請求池 (polite pool) 速率為 10 req/s
+# 為確保多個 Worker Lambda 併發執行時總速率不超標，
+# 我們在單一 Worker 內部進行速率控制。
+# 每次 API call 後等待一小段時間。
+# 若 Lambda 併發數設為 10，則 REQUEST_INTERVAL_SECONDS 設為 1.0 秒，
+# 總速率就會被控制在 10 req/s 左右。
+# 這裡設定一個保守值。
+REQUEST_INTERVAL_SECONDS = 0.2 # 5 req/s per worker
+
+class RateLimiter:
+    """A simple rate limiter using time.perf_counter for precision."""
+    def __init__(self, interval_seconds: float):
+        self.interval = interval_seconds
+        self.last_call_time = 0
+
+    def wait(self):
+        """Waits if the time since the last call is less than the interval."""
+        elapsed = time.perf_counter() - self.last_call_time
+        if elapsed < self.interval:
+            time.sleep(self.interval - elapsed)
+        self.last_call_time = time.perf_counter()
+
+# 初始化全域速率控制器
+rate_limiter = RateLimiter(REQUEST_INTERVAL_SECONDS)
+
+def lambda_handler(event: Dict[str, Any], context: object) -> None:
     """
-    Lambda 處理函式，由 SQS 觸發。
-    此函式預期每個 SQS record 的 body 是一個包含多篇論文的 JSON 列表。
-    新增了檢查 S3 是否已存在結果的功能。
+    Processes a batch of records from S3, queries OpenAlex,
+    and saves results back to S3.
     """
-    for record in event.get('Records', []):
-        original_message = record.get('body', '[]')
-        
+    for record in event['Records']:
+        message_body = json.loads(record['body'])
+        batch_s3_key = message_body['s3_key']
+        batch_id = message_body.get('batch_id', 'N/A')
+        logger.info(f"Processing batch_id: {batch_id} from s3://{BUCKET}/{batch_s3_key}")
+
         try:
-            paper_batch = json.loads(original_message)
-            if not isinstance(paper_batch, list):
-                raise TypeError("Message body is not a list.")
-                
-            print(f"收到一個包含 {len(paper_batch)} 篇論文的批次，開始處理...")
+            # 下載 S3 批次檔
+            s3_object = s3_client.get_object(Bucket=BUCKET, Key=batch_s3_key)
+            lines = s3_object['Body'].read().decode('utf-8').splitlines()
 
-            # 迴圈處理批次中的每一篇論文
-            for paper_data in paper_batch:
-                paper_id = paper_data.get('id')
-                title = paper_data.get('title')
-
-                if not paper_id or not title:
-                    print(f"批次中發現無效的論文紀錄: {paper_data}")
-                    log_permanent_error(paper_id or 'unknown_id', 'MalformedRecordInBatch', 'Record in batch is missing paper_id or title', str(paper_data))
+            for line in lines:
+                if not line.strip():
                     continue
-                
-                # --- 主要邏輯修改點：檢查結果是否已存在 ---
-                success_key = f"citation_results/success/{paper_id}.json"
                 try:
-                    s3.head_object(Bucket=S3_BUCKET_NAME, Key=success_key)
-                    print(f"  - 結果已存在，跳過 Paper ID: {paper_id}")
-                    continue # 如果檔案存在，直接跳到下一篇論文
-                except s3.exceptions.ClientError as e:
-                    # 如果錯誤是 404 (Not Found)，表示檔案不存在，這是我們預期的情況
-                    if e.response['Error']['Code'] == '404':
-                        pass # 檔案不存在，繼續執行下面的處理邏輯
-                    else:
-                        # 如果是其他 ClientError (如權限問題)，則記錄並跳過
-                        print(f"  - 檢查 S3 物件時發生非 404 錯誤: {e}")
-                        log_permanent_error(paper_id, 'S3HeadObjectError', str(e), str(paper_data))
-                        continue
-                
-                print(f"  - 正在處理 Paper ID: {paper_id}")
-                process_paper(paper_id, title, str(paper_data))
-                time.sleep(0.11)
-
-        except (json.JSONDecodeError, TypeError) as e:
-            print(f"無法解析批次訊息或格式錯誤: {e}")
-            log_permanent_error('unknown_batch_id', type(e).__name__, str(e), original_message)
-            continue
+                    original_record = json.loads(line)
+                    process_single_record(original_record)
+                except json.JSONDecodeError:
+                    logger.error(f"Skipping invalid JSON line in batch {batch_id}: {line}")
+                except Exception as e:
+                    # 處理單筆紀錄時發生非預期錯誤
+                    logger.error(f"Error processing record in batch {batch_id}: {line}, Error: {e}")
+                    # 可以選擇將錯誤紀錄也存到 failure
+                    record_id = json.loads(line).get('id', 'unknown_id')
+                    failure_payload = {
+                        "id": record_id,
+                        "title": json.loads(line).get('title', 'unknown_title'),
+                        "error": f"Internal processing error: {str(e)}"
+                    }
+                    save_to_s3(failure_payload, record_id, is_success=False)
 
         except Exception as e:
-            print(f"批次處理中發生可重試的錯誤，將重試整個批次。錯誤: {e}")
-            raise e
+            # 處理整個批次檔時發生錯誤（如下載失敗），此訊息會被重試或進入 DLQ
+            logger.error(f"FATAL: Could not process batch {batch_s3_key}. Error: {e}")
+            raise e # 拋出異常，讓 SQS 知道此訊息處理失敗
 
-def process_paper(paper_id: str, title: str, original_record_str: str):
+
+def process_single_record(record: Dict[str, Any]):
     """
-    使用 OpenAlex API 處理單篇論文的查詢邏輯。
+    Queries OpenAlex for a single record and saves the result.
     """
+    arxiv_id = record.get('id')
+    title = record.get('title')
+
+    if not arxiv_id or not title:
+        logger.warning(f"Skipping record with missing id or title: {record}")
+        return
+
     try:
-        safe_title = urllib.parse.quote_plus(f'"{title}"')
-        works_url = f"https://api.openalex.org/works?search={safe_title}&per_page=1&mailto={OPENALEX_EMAIL}"
-        
-        r_works = requests.get(works_url, timeout=30)
-        r_works.raise_for_status()
-        works_data = r_works.json()
+        # 1. 查詢 OpenAlex Works API
+        # 使用 quote_plus 確保 title 中的特殊字元被正確編碼
+        encoded_title = quote_plus(f'"{title}"')
+        works_url = f"https://api.openalex.org/works?search={encoded_title}&per_page=1&mailto={secrets.token_hex(4) + "@example.com"}"
 
-        if not works_data.get("results"):
-            log_not_found(paper_id, title, 'No results returned from OpenAlex.')
-            return
+        rate_limiter.wait() # 查詢前等待，確保速率
+        response = session.get(works_url, timeout=15)
+        response.raise_for_status() # 確保請求成功 (2xx)
+        works_data = response.json()
 
-        paper_data = works_data["results"][0]
+        if not works_data.get('results'):
+            raise ValueError("No results found in OpenAlex for the given title.")
 
-        author_info = []
-        author_ids = [
-            authorship['author']['id'].split('/')[-1] 
-            for authorship in paper_data.get('authorships', []) 
-            if authorship.get('author') and authorship['author'].get('id')
-        ]
-        
-        if author_ids:
-            author_id_filter = '|'.join(author_ids)
-            authors_url = f"https://api.openalex.org/authors?filter=openalex_id:{author_id_filter}&per_page={len(author_ids)}&mailto={OPENALEX_EMAIL}"
-            
-            r_authors = requests.get(authors_url, timeout=30)
-            r_authors.raise_for_status()
-            authors_data = r_authors.json()
-            
-            author_details_map = {author['id'].split('/')[-1]: author for author in authors_data.get('results', [])}
-            
-            for authorship in paper_data.get('authorships', []):
-                 if authorship.get('author') and authorship['author'].get('id'):
-                    auth_id = authorship['author']['id'].split('/')[-1]
-                    details = author_details_map.get(auth_id)
-                    display_name = authorship.get('author', {}).get('display_name')
-                    h_index = details.get('summary_stats', {}).get('h_index') if details else None
-                    author_info.append({'name': display_name, 'hIndex': h_index})
+        work_result = works_data['results'][0]
 
-        result = {
-            'original_id': paper_id,
-            'searched_title': title,
-            'found_paper_title': paper_data.get('display_name'),
-            'citationCount': paper_data.get('cited_by_count'),
-            'authors': author_info
-        }
-        
-        s3_key = f"citation_results/success/{paper_id}.json"
-        s3.put_object(Bucket=S3_BUCKET_NAME, Key=s3_key, Body=json.dumps(result, indent=2, ensure_ascii=False))
-        print(f"  -> SUCCESS: Paper ID {paper_id} processed and saved.")
+        # 2. 提取 Work 資訊
+        record["oa_display_name"] = work_result.get("display_name")
+        record["cited_by_count"] = work_result.get("cited_by_count", 0)
 
-    except requests.exceptions.HTTPError as e:
-        status_code = e.response.status_code
-        if status_code == 429 or status_code >= 500:
-            handle_retriable_error(e, paper_id, title, original_record_str)
-        elif status_code == 404:
-            log_not_found(paper_id, title, 'OpenAlex API returned HTTP 404.')
-        else:
-            log_permanent_error(paper_id, f"HTTPError_{status_code}", str(e), original_record_str)
+        # 3. 查詢作者 h-index
+        authorships = work_result.get("authorships", [])
+        authors_hindex = []
+
+        for authorship in authorships:
+            author_info = authorship.get("author", {})
+            author_id = author_info.get("id")
+            author_name = author_info.get("display_name")
+
+            if author_id:
+                try:
+                    author_url = f"{author_id}?mailto={secrets.token_hex(4) + "@example.com"}"
+                    rate_limiter.wait() # 查詢前等待，確保速率
+                    author_res = session.get(author_url, timeout=10)
+                    author_res.raise_for_status()
+                    author_data = author_res.json()
+                    h_index = author_data.get("summary_stats", {}).get("h_index", 0)
+                    authors_hindex.append({"name": author_name, "h_index": h_index})
+                except requests.exceptions.RequestException as author_e:
+                    logger.warning(f"Could not fetch h-index for author {author_id}: {author_e}")
+                    authors_hindex.append({"name": author_name, "h_index": None}) # 紀錄查詢失敗
+
+        record["authors_hindex"] = authors_hindex
+
+        # 4. 儲存成功結果
+        save_to_s3(record, arxiv_id, is_success=True)
+        logger.info(f"Successfully processed and saved record: {arxiv_id}")
 
     except Exception as e:
-        handle_retriable_error(e, paper_id, title, original_record_str)
+        # 處理所有查詢失敗的情況
+        logger.error(f"Failed to process record {arxiv_id} ('{title}'). Error: {str(e)}")
+        failure_payload = {
+            "id": arxiv_id,
+            "title": title,
+            "error": str(e)
+        }
+        save_to_s3(failure_payload, arxiv_id, is_success=False)
 
-def log_not_found(paper_id, title, details):
-    not_found_info = {'paper_id': paper_id, 'title': title, 'status': 'Not Found', 'details': details}
-    s3_key = f"citation_results/not_found/{paper_id}.json"
-    s3.put_object(Bucket=S3_BUCKET_NAME, Key=s3_key, Body=json.dumps(not_found_info, indent=2, ensure_ascii=False))
-    print(f"  -> NOT FOUND: Paper ID {paper_id} logged.")
 
-def log_permanent_error(paper_id, error_type, error_message, original_message):
-    error_info = {'error_type': error_type, 'error_message': error_message, 'original_message': original_message}
-    s3_key = f"citation_results/error/{paper_id}_permanent_error.json"
-    s3.put_object(Bucket=S3_BUCKET_NAME, Key=s3_key, Body=json.dumps(error_info, indent=2, ensure_ascii=False))
+def save_to_s3(payload: Dict[str, Any], file_id: str, is_success: bool):
+    """Saves the final payload to the appropriate S3 folder."""
+    folder = SUCCESS_FOLDER if is_success else FAILURE_FOLDER
+    # 清理 file_id，避免路徑遍歷問題
+    safe_file_id = file_id.replace('/', '_')
+    output_key = f"{OUTPUT_PREFIX}{folder}{safe_file_id}.json" # 注意，存為 .json 而非 .jsonl
 
-def handle_retriable_error(e, paper_id, title, original_message):
-    print(f"  -> ERROR processing Paper ID {paper_id}: {type(e).__name__} - {str(e)}")
-    error_info = {
-        'paper_id': paper_id, 'title': title, 'error_type': type(e).__name__,
-        'error_message': str(e), 'full_traceback': traceback.format_exc(),
-        'original_message': original_message
-    }
-    s3_key = f"citation_results/error/{paper_id}_retriable.json"
-    s3.put_object(Bucket=S3_BUCKET_NAME, Key=s3_key, Body=json.dumps(error_info, indent=2, ensure_ascii=False))
-    raise e
+    s3_client.put_object(
+        Bucket=BUCKET,
+        Key=output_key,
+        Body=json.dumps(payload, ensure_ascii=False),
+        ContentType='application/json'
+    )
