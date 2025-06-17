@@ -33,7 +33,9 @@ Resources:
       CodeUri: src/dispatcher_citation/
       Handler: citation_dispatcher_lambda.handler
       Timeout: 900
-      MemorySize: 1024
+      MemorySize: 4096
+      EphemeralStorage:
+        Size: 2048
       Environment:
         Variables:
           SQS_QUEUE_URL: !Ref CitationJobQueue
