@@ -9,9 +9,9 @@ import secrets
 
 # --- Environment Variables ---
 BUCKET = os.environ['BUCKET']
-OPENALEX_EMAIL = os.environ['OPENALEX_EMAIL']
-SUCCESS_PREFIX = os.environ.get('SUCCESS_PREFIX', 'results/success')
-FAILURE_PREFIX = os.environ.get('FAILURE_PREFIX', 'results/failure')
+# OPENALEX_EMAIL = os.environ['OPENALEX_EMAIL']
+SUCCESS_PREFIX = os.environ.get('SUCCESS_PREFIX', 'citation_results2/success')
+FAILURE_PREFIX = os.environ.get('FAILURE_PREFIX', 'citation_results2/failure')
 
 # --- Boto3/API Clients ---
 s3_client = boto3.client('s3')

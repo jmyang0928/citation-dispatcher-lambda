@@ -5,7 +5,7 @@ import os
 # --- Environment Variables ---
 BUCKET = os.environ['BUCKET']
 INPUT_KEY = os.environ['INPUT_KEY']
-BATCH_PREFIX = os.environ['BATCH_PREFIX']
+BATCH_PREFIX = os.environ.get('BATCH_PREFIX', 'citation_batches_tmp')
 PROCESS_QUEUE_URL = os.environ['PROCESS_QUEUE_URL']
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 100))
 
