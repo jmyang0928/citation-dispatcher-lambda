@@ -2,85 +2,73 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
   arxiv-citation-scanner
+  從既有 S3 Bucket 讀取論文列表，並行查詢 Semantic Scholar 引用資訊
 
-  一個高效的、基於 Lambda 的論文引用資訊並行查詢器，
-  從 S3 讀取論文列表，並使用 Semantic Scholar API 查詢數據。
+Parameters:
+  ExistingDataBucketName:
+    Type: String
+    Description: Name of the **existing** S3 bucket that stores paper data
+    Default: arxiv-dataset-376926525020-us-east-1
 
 Globals:
   Function:
     Runtime: python3.9
-    MemorySize: 512            # 為 Pandas 和 API 客戶端提供足夠的記憶體
+    MemorySize: 512
     Architectures:
       - x86_64
 
 Resources:
-  # ----------------------------------------------------------------
-  # 通用資源
-  # ----------------------------------------------------------------
-  ArxivDataBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Sub "arxiv-dataset-${AWS::AccountId}-${AWS::Region}"
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-
-  # ----------------------------------------------------------------
-  # 論文引用資訊查詢 (Semantic Scholar)
-  # ----------------------------------------------------------------
+  # ---- SQS 隊列 ----
   CitationJobQueue:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: CitationJobQueue
-      # 將可見性超時設定為比 Worker 的超時時間稍長
       VisibilityTimeout: 500
-      MessageRetentionPeriod: 1209600   # 任務最長可保留 14 天
+      MessageRetentionPeriod: 1209600   # 14 天
 
+  # ---- Dispatcher Lambda ----
   CitationDispatcherFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/dispatcher_citation/
       Handler: citation_dispatcher_lambda.handler
-      Timeout: 900         # 15 分鐘，足以處理非常大的 CSV 檔案
-      MemorySize: 1024     # Pandas 讀取大檔案需要更多記憶體
+      Timeout: 900
+      MemorySize: 1024
       Environment:
         Variables:
           SQS_QUEUE_URL: !Ref CitationJobQueue
-          S3_BUCKET_NAME: !Ref ArxivDataBucket
+          S3_BUCKET_NAME: !Ref ExistingDataBucketName
       Policies:
-        # 讀取 S3 上的論文列表
-        - S3ReadPolicy:
-            BucketName: !Ref ArxivDataBucket
-        - SQSSendMessagePolicy:
+        - S3ReadPolicy:        # 讀 S3 上的論文 CSV
+            BucketName: !Ref ExistingDataBucketName
+        - SQSSendMessagePolicy # 發送訊息到隊列
             QueueName: !Ref CitationJobQueue
 
+  # ---- Worker Lambda ----
   CitationWorkerFunction:
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: src/worker_citation/     # 需要包含 requirements.txt
+      CodeUri: src/worker_citation/
       Handler: citation_worker_lambda.handler
-      Timeout: 450      # 7.5 分鐘
+      Timeout: 450
       Environment:
         Variables:
-          S3_BUCKET_NAME: !Ref ArxivDataBucket
+          S3_BUCKET_NAME: !Ref ExistingDataBucketName
       Policies:
-        # 寫入查詢結果到 S3
-        - S3WritePolicy:
-            BucketName: !Ref ArxivDataBucket
+        - S3WritePolicy:       # 寫回查詢結果
+            BucketName: !Ref ExistingDataBucketName
       Events:
         SQSTrigger:
           Type: SQS
           Properties:
             Queue: !GetAtt CitationJobQueue.Arn
-            BatchSize: 1      # 每次只處理一篇論文，確保任務獨立性
+            BatchSize: 1
 
 Outputs:
-  S3BucketName:
-    Description: "儲存所有數據的 S3 儲存桶名稱"
-    Value: !Ref ArxivDataBucket
+  DataBucketName:
+    Description: "Existing S3 Bucket used for paper data"
+    Value: !Ref ExistingDataBucketName
 
   CitationDispatcherFunctionName:
-    Description: "引用查詢分派器 Lambda 名稱"
+    Description: "Dispatcher Lambda Function name"
     Value: !Ref CitationDispatcherFunction
