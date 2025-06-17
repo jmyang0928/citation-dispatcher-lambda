@@ -3,12 +3,13 @@ Transform: AWS::Serverless-2016-10-31
 Description: >
   arxiv-citation-scanner
 
-  一個高效的、基於 Lambda 的論文引用資訊並行查詢器，從 S3 讀取論文列表，並使用 Semantic Scholar API 查詢數據。
+  一個高效的、基於 Lambda 的論文引用資訊並行查詢器，
+  從 S3 讀取論文列表，並使用 Semantic Scholar API 查詢數據。
 
 Globals:
   Function:
     Runtime: python3.9
-    MemorySize: 512 # 為 Pandas 和 API 客戶端提供足夠的記憶體
+    MemorySize: 512            # 為 Pandas 和 API 客戶端提供足夠的記憶體
     Architectures:
       - x86_64
 
@@ -35,45 +36,51 @@ Resources:
       QueueName: CitationJobQueue
       # 將可見性超時設定為比 Worker 的超時時間稍長
       VisibilityTimeout: 500
-      MessageRetentionPeriod: 1209600 # 任務最長可保留 14 天
+      MessageRetentionPeriod: 1209600   # 任務最長可保留 14 天
 
   CitationDispatcherFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/dispatcher_citation/
       Handler: citation_dispatcher_lambda.handler
-      Timeout: 900 # 15 分鐘，足以處理非常大的 CSV 檔案
-      MemorySize: 1024 # Pandas 讀取大檔案需要更多記憶體
+      Timeout: 900         # 15 分鐘，足以處理非常大的 CSV 檔案
+      MemorySize: 1024     # Pandas 讀取大檔案需要更多記憶體
       Environment:
         Variables:
           SQS_QUEUE_URL: !Ref CitationJobQueue
           S3_BUCKET_NAME: !Ref ArxivDataBucket
       Policies:
-        - S3ReadPolicy: { BucketName: !Ref ArxivDataBucket }
-        - SQSQueuePolicy: { QueueName: !GetAtt CitationJobQueue.QueueName }
+        # 讀取 S3 上的論文列表
+        - S3ReadPolicy:
+            BucketName: !Ref ArxivDataBucket
+        - SQSSendMessagePolicy:
+            QueueName: !Ref CitationJobQueue
 
   CitationWorkerFunction:
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: src/worker_citation/ # 需要包含 requirements.txt
+      CodeUri: src/worker_citation/     # 需要包含 requirements.txt
       Handler: citation_worker_lambda.handler
-      Timeout: 450 # 根據您的要求，設定為 450 秒 (7.5 分鐘)
+      Timeout: 450      # 7.5 分鐘
       Environment:
         Variables:
           S3_BUCKET_NAME: !Ref ArxivDataBucket
       Policies:
-        - S3WritePolicy: { BucketName: !Ref ArxivDataBucket }
+        # 寫入查詢結果到 S3
+        - S3WritePolicy:
+            BucketName: !Ref ArxivDataBucket
       Events:
         SQSTrigger:
           Type: SQS
           Properties:
             Queue: !GetAtt CitationJobQueue.Arn
-            BatchSize: 1 # 每次只處理一篇論文，確保任務獨立性
+            BatchSize: 1      # 每次只處理一篇論文，確保任務獨立性
 
 Outputs:
   S3BucketName:
     Description: "儲存所有數據的 S3 儲存桶名稱"
     Value: !Ref ArxivDataBucket
+
   CitationDispatcherFunctionName:
     Description: "引用查詢分派器 Lambda 名稱"
     Value: !Ref CitationDispatcherFunction
