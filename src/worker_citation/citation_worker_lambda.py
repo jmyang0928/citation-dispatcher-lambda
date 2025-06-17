@@ -2,26 +2,22 @@ import json
 import os
 import boto3
 from semanticscholar import SemanticScholar
+# --- FIX IS HERE: Import exception from the correct submodule ---
+from semanticscholar.errors import PaperNotFoundException
 
-try:
-    from semanticscholar.exceptions import PaperNotFoundException
-except ImportError:
-    from semanticscholar import PaperNotFoundException
-
-# 從環境變數獲取 S3 儲存桶名稱
+# From environment variables
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
 if not S3_BUCKET_NAME:
     raise ValueError("Environment variable S3_BUCKET_NAME is not set")
 
-# 初始化客戶端
+# AWS clients
 s3 = boto3.client('s3')
-# 在 Lambda 全局範圍內初始化，以便在 warm start 時重複使用連線
-# timeout 應小於 Lambda 的總超時時間
+# Initialize client in the global scope for connection reuse on warm starts
 sch = SemanticScholar(timeout=30)
 
 def handler(event, context):
     """
-    Lambda 處理函式，由 SQS 觸發。
+    Lambda handler triggered by SQS.
     """
     for record in event.get('Records', []):
         paper_id = 'unknown_id'
@@ -32,16 +28,14 @@ def handler(event, context):
 
             if not paper_id or not title:
                 print(f"Invalid message, missing paper_id or title: {record.get('body')}")
-                # 不需要重試這種格式錯誤的訊息
                 continue
 
             print(f"Processing Paper ID: {paper_id}")
             
-            # 執行 Semantic Scholar 查詢
             process_paper(paper_id, title)
 
         except Exception as e:
-            # 捕獲所有未預期的錯誤，例如 JSON 解析錯誤或未知異常
+            # Catch any unexpected errors during processing
             error_info = {
                 'error_type': type(e).__name__,
                 'error_message': str(e),
@@ -54,15 +48,15 @@ def handler(event, context):
                 Body=json.dumps(error_info, indent=2, ensure_ascii=False)
             )
             print(f"An unexpected error occurred for Paper ID {paper_id}. Details logged to {s3_key}")
-            # 不拋出異常，讓 SQS 認為訊息已處理，避免因程式碼 Bug 導致無限重試
-
+            # Do not re-raise the exception, so the message is removed from the queue
+            # and not retried infinitely for a code bug.
 
 def process_paper(paper_id: str, title: str):
     """
-    處理單篇論文的查詢邏輯，並將結果寫入 S3。
+    Processes a single paper: queries Semantic Scholar and writes the result to S3.
     """
     try:
-        # 1. 搜尋論文
+        # 1. Search for the paper
         search_results = sch.search_paper(
             query=title, 
             limit=1, 
@@ -70,22 +64,24 @@ def process_paper(paper_id: str, title: str):
         )
 
         if not search_results or not search_results[0].get('paperId'):
+            # Trigger the specific exception if no results are found
             raise PaperNotFoundException(f"No results found for title '{title}'.")
 
         paper = search_results[0]
         
-        # 2. 獲取作者的 H-index
+        # 2. Get h-index for authors
         author_ids = [a['authorId'] for a in paper.get('authors', []) if a.get('authorId')]
         authors_details = []
         if author_ids:
-            batch_size = 100 # API 一次最多接受 500 個 ID，但設小一點更安全
+            # Get author details in batches to be safe
+            batch_size = 100
             for i in range(0, len(author_ids), batch_size):
                 batch_ids = author_ids[i:i+batch_size]
                 authors_details.extend(sch.get_authors(batch_ids, fields=["name", "hIndex"]))
 
         author_info = [{'name': a.name, 'hIndex': a.hIndex} for a in authors_details if a]
 
-        # 3. 組合成功結果
+        # 3. Format and save the successful result
         result = {
             'original_id': paper_id,
             'searched_title': title,
@@ -101,7 +97,7 @@ def process_paper(paper_id: str, title: str):
         print(f"SUCCESS: Paper ID {paper_id} processed and saved to {s3_key}")
 
     except PaperNotFoundException as e:
-        # 處理找不到論文的情況 (404)
+        # Handle the 404 case specifically
         not_found_info = {'paper_id': paper_id, 'title': title, 'status': 'Not Found', 'details': str(e)}
         s3_key = f"citation_results/not_found/{paper_id}.json"
         s3.put_object(
@@ -110,8 +106,8 @@ def process_paper(paper_id: str, title: str):
         print(f"NOT FOUND: Paper ID {paper_id}. Logged to {s3_key}")
     
     except Exception as e:
-        # 處理 API 請求失敗或其他可重試的錯誤
+        # Handle other API errors or transient issues
         print(f"ERROR processing Paper ID {paper_id}: {type(e).__name__} - {str(e)}")
-        # 拋出異常，這樣 SQS 會在 Visibility Timeout 後讓訊息重新可見，從而觸發重試
+        # Re-raise the exception. This will cause the Lambda to fail, and SQS will
+        # make the message visible again for a retry after the visibility timeout.
         raise e
-
