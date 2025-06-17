@@ -44,7 +44,7 @@ Resources:
         - S3ReadPolicy:        # 讀 S3 上的論文 CSV
             BucketName: !Ref ExistingDataBucketName
         - SQSSendMessagePolicy: # 發送訊息到隊列
-            QueueName: !Ref CitationJobQueue
+            QueueName: CitationJobQueue
 
   # ---- Worker Lambda ----
   CitationWorkerFunction:
