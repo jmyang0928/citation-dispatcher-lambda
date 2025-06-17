@@ -3,7 +3,12 @@ Transform: AWS::Serverless-2016-10-31
 Description: >
   arxiv-citation-scanner
 
-  一個高效的、基於 Lambda 的論文引用資訊並行查詢器，從 S3 讀取論文列表，並使用 OpenAlex API 查詢數據。
+  An efficient, Lambda-based parallel citation info fetcher that reads a paper list from S3 and queries the OpenAlex API.
+
+Parameters:
+  ExistingDataBucketName:
+    Type: String
+    Description: The name of the existing S3 bucket where all data is stored.
 
 Globals:
   Function:
@@ -13,16 +18,6 @@ Globals:
       - x86_64
 
 Resources:
-  ArxivDataBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Sub "arxiv-dataset-${AWS::AccountId}-${AWS::Region}"
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-
   CitationJobQueue:
     Type: AWS::SQS::Queue
     Properties:
@@ -40,28 +35,31 @@ Resources:
       Environment:
         Variables:
           SQS_QUEUE_URL: !Ref CitationJobQueue
-          S3_BUCKET_NAME: !Ref ArxivDataBucket
+          S3_BUCKET_NAME: !Ref ExistingDataBucketName
           INPUT_S3_PREFIX: "cleaned_data/"
       Policies:
-        - S3ReadPolicy: { BucketName: !Ref ArxivDataBucket }
-        - SQSQueuePolicy: { QueueName: !GetAtt CitationJobQueue.QueueName }
+        - S3ReadPolicy:
+            BucketName: !Ref ExistingDataBucketName
+        # --- FIX IS HERE: Replaced SQSQueuePolicy with the more specific SQSSendMessagePolicy ---
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt CitationJobQueue.QueueName
         - LambdaInvokePolicy:
             FunctionName: !Ref CitationDispatcherFunction
 
   CitationWorkerFunction:
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: src/worker_citation/ # 需要包含 requirements.txt (requests)
+      CodeUri: src/worker_citation/ # Requires requests library
       Handler: citation_worker_lambda.handler
       Timeout: 450
       ReservedConcurrentExecutions: 50
       Environment:
         Variables:
-          S3_BUCKET_NAME: !Ref ArxivDataBucket
-          # --- 新增的環境變數 ---
-          OPENALEX_EMAIL: "your-email@example.com" # 建議部署後修改為真實 Email
+          S3_BUCKET_NAME: !Ref ExistingDataBucketName
+          OPENALEX_EMAIL: "your-email@example.com"
       Policies:
-        - S3WritePolicy: { BucketName: !Ref ArxivDataBucket }
+        - S3WritePolicy:
+            BucketName: !Ref ExistingDataBucketName
       Events:
         SQSTrigger:
           Type: SQS
@@ -71,8 +69,8 @@ Resources:
 
 Outputs:
   S3BucketName:
-    Description: "儲存所有數據的 S3 儲存桶名稱"
-    Value: !Ref ArxivDataBucket
+    Description: "Name of the S3 bucket used for storing data"
+    Value: !Ref ExistingDataBucketName
   CitationDispatcherFunctionName:
-    Description: "引用查詢分派器 Lambda 名稱"
+    Description: "Name of the Citation Dispatcher Lambda function"
     Value: !Ref CitationDispatcherFunction
