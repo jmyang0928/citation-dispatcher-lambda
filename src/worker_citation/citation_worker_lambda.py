@@ -1,7 +1,12 @@
 import json
 import os
 import boto3
-from semanticscholar import SemanticScholar, PaperNotFoundException
+from semanticscholar import SemanticScholar
+
+try:
+    from semanticscholar.exceptions import PaperNotFoundException
+except ImportError:
+    from semanticscholar import PaperNotFoundException
 
 # 從環境變數獲取 S3 儲存桶名稱
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
