@@ -3,7 +3,7 @@ Transform: AWS::Serverless-2016-10-31
 Description: >
   arxiv-citation-scanner
 
-  一個高效的、基於 Lambda 的論文引用資訊並行查詢器，從 S3 讀取論文列表，並使用 OpenAlex API 查詢數據。
+  An efficient, Lambda-based parallel citation info fetcher that reads a paper list from S3 and queries the OpenAlex API.
 
 Parameters:
   ExistingDataBucketName:
@@ -59,7 +59,9 @@ Resources:
           S3_BUCKET_NAME: !Ref ExistingDataBucketName
           OPENALEX_EMAIL: "your-email@example.com"
       Policies:
-        - S3WritePolicy:
+        # --- FIX IS HERE: Changed S3WritePolicy to S3CrudPolicy ---
+        # S3CrudPolicy grants permissions for Get, Put, and Delete actions.
+        - S3CrudPolicy:
             BucketName: !Ref ExistingDataBucketName
       Events:
         SQSTrigger:
@@ -70,8 +72,8 @@ Resources:
 
 Outputs:
   S3BucketName:
-    Description: "儲存所有數據的 S3 儲存桶名稱"
+    Description: "Name of the S3 bucket used for storing data"
     Value: !Ref ExistingDataBucketName
   CitationDispatcherFunctionName:
-    Description: "引用查詢分派器 Lambda 名稱"
+    Description: "Name of the Citation Dispatcher Lambda function"
     Value: !Ref CitationDispatcherFunction
